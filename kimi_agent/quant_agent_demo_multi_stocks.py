@@ -499,7 +499,7 @@ class FactorMiningAgent:
         factors = []
         existing_names = [f.name for f in self.factor_library]
         anchor_stock = next(iter(stock_dataset.values()))
-        
+        # 随便拿一只股票当“提示样本”，让 LLM 基于它生成因子创意（只是用来“想点子”）。
         for i in range(max_factors):
             print(f"\n  🔄 因子生成 #{i+1}/{max_factors}")
             
@@ -554,7 +554,7 @@ class FactorMiningAgent:
         try:
             prices = stock_data.prices
             volumes = stock_data.volumes
-            returns = stock_data.returns()
+            returns = stock_data.returns() # 计算每天回报（第一天没有）
             sentiment_score = sentiment_scores.reindex(prices.index).fillna(0)
             
             # 构建安全的局部命名空间
@@ -636,7 +636,7 @@ class StrategyAgent:
                           stock_data: StockData) -> pd.Series:
         """合成多因子信号 (IC加权)"""
         signal = pd.Series(0.0, index=stock_data.prices.index)
-        total_ic = sum(abs(f.ic) for f in factors)
+        total_ic = sum(abs(f.ic) for f in factors) # 肯定非负
         
         for factor in factors:
             weight = abs(factor.ic) / total_ic if total_ic > 0 else 1.0 / len(factors)
@@ -670,7 +670,10 @@ class BacktestEngine:
         
     def run(self, stock_data: StockData, signal: pd.Series,
             strategy_factors: List[Factor]) -> BacktestResult:
-        """执行回测"""
+        """执行回测
+        这个函数就是一个“单资产（可以是聚合出来的组合资产）、单仓位、只做多、规则驱动”的最小回测器：
+        信号强就买，信号反了/到期/止损就卖，然后算一套常用绩效指标。
+        """
         print(f"\n{'='*50}")
         print(f"🤖 [{self.name}] 开始回测 (初始资金: ¥{self.initial_capital:,.0f})")
         print(f"{'='*50}")
@@ -762,19 +765,19 @@ class BacktestEngine:
         equity_series = pd.Series(equity, index=prices.index[:len(equity)])
         
         # 计算性能指标
-        total_return = (capital - self.initial_capital) / self.initial_capital
-        n_years = len(prices) / 252
-        annual_return = (capital / self.initial_capital) ** (1 / max(n_years, 0.01)) - 1
+        total_return = (capital - self.initial_capital) / self.initial_capital # 总收益率
+        n_years = len(prices) / 252 # 252 个交易日≈1年
+        annual_return = (capital / self.initial_capital) ** (1 / max(n_years, 0.01)) - 1 # 年化收益率
         
-        equity_returns = equity_series.pct_change().dropna()
-        sharpe = (equity_returns.mean() / (equity_returns.std() + 1e-10)) * np.sqrt(252)
+        equity_returns = equity_series.pct_change().dropna() # 权益日收益
+        sharpe = (equity_returns.mean() / (equity_returns.std() + 1e-10)) * np.sqrt(252) # 夏普比率，单位波动风险换来多少收益，越高通常越好。
         
-        cummax = equity_series.cummax()
-        drawdown = (equity_series - cummax) / cummax
-        max_dd = drawdown.min()
+        cummax = equity_series.cummax() # 历史最高权益
+        drawdown = (equity_series - cummax) / cummax # 回撤序列，当前权益相对历史最高点回撤了多少。通常是负数，比如 -0.15 表示从高点回撤 15%。
+        max_dd = drawdown.min()# 最大回撤
         
-        calmar = annual_return / abs(max_dd) if max_dd != 0 else 0
-        win_rate = win_count / trade_count if trade_count > 0 else 0
+        calmar = annual_return / abs(max_dd) if max_dd != 0 else 0 # 卡玛比率，年化收益 / 最大回撤绝对值。
+        win_rate = win_count / trade_count if trade_count > 0 else 0 # 胜率，盈利交易次数 / 总交易次数。
         
         result = BacktestResult(
             total_return=total_return,
@@ -996,7 +999,7 @@ class QuantResearchSystem:
             max_factors: int = 5) -> Dict:
         """
         执行完整的量化投研Pipeline
-        
+
         Returns:
             包含所有中间结果和最终决策的字典
         """
