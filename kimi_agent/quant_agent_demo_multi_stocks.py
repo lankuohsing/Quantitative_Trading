@@ -1318,10 +1318,26 @@ def plot_results(results: Dict):
         import matplotlib
         matplotlib.use('Agg')
         import matplotlib.pyplot as plt
+        from matplotlib import font_manager
     except ImportError:
         print("\n⚠️ matplotlib未安装，跳过图表绘制")
         print("   安装: pip install matplotlib")
         return
+
+    # 兼容中文显示（按可用字体自动选择）
+    font_candidates = [
+        'PingFang SC', 'Hiragino Sans GB', 'Heiti SC',
+        'Noto Sans CJK SC', 'Microsoft YaHei', 'SimHei',
+        'Arial Unicode MS'
+    ]
+    available_fonts = {f.name for f in font_manager.fontManager.ttflist}
+    selected_font = next((f for f in font_candidates if f in available_fonts), None)
+    if selected_font:
+        plt.rcParams['font.sans-serif'] = [selected_font]
+    else:
+        # 找不到中文字体时保留默认，避免直接报错
+        print("⚠️ 未检测到常见中文字体，图中中文可能显示为方块")
+    plt.rcParams['axes.unicode_minus'] = False
     
     backtest = results['backtest']
     if backtest is None:
@@ -1348,7 +1364,9 @@ def plot_results(results: Dict):
     
     # 3. 交易标记
     ax3 = axes[2]
-    prices = results['stock_data'].prices
+    prices = results['stock_data'].prices.reindex(equity.index).dropna()
+    if prices.empty:
+        prices = results['stock_data'].prices
     ax3.plot(prices.index, prices, 'k-', linewidth=0.8, alpha=0.7)
     
     for t in backtest.trades:
