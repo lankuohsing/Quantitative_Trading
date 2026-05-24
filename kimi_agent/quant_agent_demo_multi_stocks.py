@@ -1006,20 +1006,29 @@ class QuantResearchSystem:
         print(f"\n{'#'*60}")
         print(f"# 标的: {', '.join(stock_codes)} | 区间: {start_date} ~ {end_date}")
         print(f"# 最大迭代: {self.max_iterations} | 模式: {'自动' if self.human.auto_mode else '人工'}")
+        print(f"# 数据切分: Train=60% | Validation=20% | Test=20%")
         print(f"{'#'*60}")
         
         # ============ Step 1: 数据采集 ============
         data_result = self.data_agent.run(stock_codes, start_date, end_date)
-        stock_data = data_result['stock_data']
-        stock_dataset = data_result['stock_dataset']
-        sentiment_scores_map = data_result['sentiment_scores_map']
+        split_data = self._split_dataset(
+            data_result['stock_dataset'],
+            data_result['sentiment_scores_map'],
+            train_ratio=0.6,
+            val_ratio=0.2
+        )
+        train_data = split_data['train']
+        val_data = split_data['validation']
+        test_data = split_data['test']
+        split_ranges = split_data['ranges']
         
         # ============ Step 2: 因子挖掘 (循环迭代) ============
         final_decision = 'iterate'
         all_factors = []
-        backtest_result = None
+        backtest_result = None   # Validation回测结果
         risk_result = None
         strategy_result = None
+        selected_top_n = 3
         
         while final_decision == 'iterate' and self.iteration_count < self.max_iterations:
             self.iteration_count += 1
@@ -1029,7 +1038,9 @@ class QuantResearchSystem:
             
             # 2a. 因子挖掘
             new_factors = self.factor_agent.run(
-                stock_dataset, sentiment_scores_map, max_factors=max_factors
+                train_data['stock_dataset'],
+                train_data['sentiment_scores_map'],
+                max_factors=max_factors
             )
             all_factors.extend(new_factors)
             
@@ -1042,15 +1053,26 @@ class QuantResearchSystem:
                 print("  ⛔ 因子未通过人工审核，重新生成")
                 continue
             
-            # ============ Step 3: 策略构建 ============
-            strategy_result = self.strategy_agent.run(stock_data, all_factors)
-            
-            # ============ Step 4: 回测 ============
-            backtest_result = self.backtest_engine.run(
-                stock_data,
-                strategy_result['composite_signal'],
-                strategy_result['selected_factors']
+            # ============ Step 3: 在Train上构建候选策略，在Validation上调参 ============
+            train_factor_pool = self._materialize_factors_for_dataset(
+                all_factors,
+                train_data['stock_dataset'],
+                train_data['sentiment_scores_map']
             )
+            val_factor_pool = self._materialize_factors_for_dataset(
+                all_factors,
+                val_data['stock_dataset'],
+                val_data['sentiment_scores_map']
+            )
+            best_candidate = self._select_top_n_by_validation(
+                train_data['stock_data'],
+                val_data['stock_data'],
+                train_factor_pool,
+                val_factor_pool
+            )
+            selected_top_n = best_candidate['top_n']
+            strategy_result = best_candidate['strategy']
+            backtest_result = best_candidate['backtest']
             
             # ============ Step 5: 风控检查 ============
             risk_result = self.risk_agent.run(backtest_result, self.llm)
@@ -1062,14 +1084,45 @@ class QuantResearchSystem:
                 print(f"\n  ↩️ 返回因子挖掘，尝试新因子...")
                 # 下一轮会生成不同的因子 ( MockLLM有随机性 )
         
+        # ============ Step 7: Test盲测（仅在迭代结束后执行一次） ============
+        test_backtest_result = None
+        test_strategy_result = None
+        test_risk_result = None
+        if strategy_result and all_factors:
+            print(f"\n{'='*60}")
+            print("🧪 Final Test (盲测阶段)")
+            print(f"{'='*60}")
+            test_factor_pool = self._materialize_factors_for_dataset(
+                all_factors,
+                test_data['stock_dataset'],
+                test_data['sentiment_scores_map']
+            )
+            test_strategy_result = self.strategy_agent.run(
+                test_data['stock_data'], test_factor_pool, top_n=selected_top_n
+            )
+            test_backtest_result = self.backtest_engine.run(
+                test_data['stock_data'],
+                test_strategy_result['composite_signal'],
+                test_strategy_result['selected_factors']
+            )
+            test_risk_result = self.risk_agent.run(test_backtest_result, self.llm)
+        
         # ============ 输出最终结果 ============
         return self._compile_results(
             data_result, all_factors, strategy_result,
-            backtest_result, risk_result, final_decision
+            backtest_result, risk_result, final_decision,
+            split_ranges=split_ranges,
+            test_strategy=test_strategy_result,
+            test_backtest=test_backtest_result,
+            test_risk=test_risk_result
         )
     
     def _compile_results(self, data_result, factors, strategy, 
-                         backtest, risk, decision) -> Dict:
+                         backtest, risk, decision,
+                         split_ranges: Dict,
+                         test_strategy=None,
+                         test_backtest=None,
+                         test_risk=None) -> Dict:
         """编译最终报告"""
         print(f"\n{'='*60}")
         print(f"📋 最终报告")
@@ -1083,10 +1136,19 @@ class QuantResearchSystem:
             print(f"  ⏸️ 达到最大迭代次数，策略待优化")
         
         print(f"\n  迭代轮次: {self.iteration_count}")
+        print(
+            f"  数据切分: "
+            f"Train[{split_ranges['train'][0]}~{split_ranges['train'][1]}], "
+            f"Validation[{split_ranges['validation'][0]}~{split_ranges['validation'][1]}], "
+            f"Test[{split_ranges['test'][0]}~{split_ranges['test'][1]}]"
+        )
         print(f"  挖掘因子: {len(factors)}个")
         if backtest:
-            print(f"  最终收益: {backtest.total_return:+.2%}")
-            print(f"  最终Sharpe: {backtest.sharpe_ratio:.2f}")
+            print(f"  Validation收益: {backtest.total_return:+.2%}")
+            print(f"  ValidationSharpe: {backtest.sharpe_ratio:.2f}")
+        if test_backtest:
+            print(f"  Test收益(盲测): {test_backtest.total_return:+.2%}")
+            print(f"  TestSharpe(盲测): {test_backtest.sharpe_ratio:.2f}")
         
         return {
             'decision': decision,
@@ -1095,10 +1157,157 @@ class QuantResearchSystem:
             'stock_dataset': data_result['stock_dataset'],
             'factors': factors,
             'strategy': strategy,
-            'backtest': backtest,
+            'backtest': test_backtest if test_backtest else backtest,
+            'validation_backtest': backtest,
+            'validation_risk': risk,
+            'test_strategy': test_strategy,
+            'test_backtest': test_backtest,
+            'test_risk': test_risk,
+            'split_ranges': split_ranges,
             'risk': risk,
             'llm_calls': self.llm.call_count
         }
+
+    def _slice_stock_data(self, stock_data: StockData, start_idx: int, end_idx: int) -> StockData:
+        """按位置切片StockData"""
+        prices = stock_data.prices.iloc[start_idx:end_idx]
+        volumes = stock_data.volumes.reindex(prices.index)
+        return StockData(
+            code=stock_data.code,
+            prices=prices,
+            volumes=volumes,
+            dates=prices.index
+        )
+
+    def _split_dataset(self, stock_dataset: Dict[str, StockData],
+                       sentiment_scores_map: Dict[str, pd.Series],
+                       train_ratio: float = 0.6, val_ratio: float = 0.2) -> Dict:
+        """将多标的数据按时间切分为 Train/Validation/Test"""
+        if not stock_dataset:
+            raise ValueError("stock_dataset 不能为空")
+
+        index_list = [s.prices.index for s in stock_dataset.values()]
+        common_index = index_list[0]
+        for idx in index_list[1:]:
+            common_index = common_index.intersection(idx)
+        common_index = common_index.sort_values()
+        n = len(common_index)
+        if n < 30:
+            raise ValueError("样本长度过短，至少需要30个交易日用于三段切分")
+
+        train_end = max(10, int(n * train_ratio))
+        val_end = min(n - 5, train_end + max(5, int(n * val_ratio)))
+
+        split_points = {
+            'train': (0, train_end),
+            'validation': (train_end, val_end),
+            'test': (val_end, n)
+        }
+
+        split_output: Dict[str, Dict[str, Any]] = {}
+        for split_name, (start_idx, end_idx) in split_points.items():
+            split_dataset: Dict[str, StockData] = {}
+            split_sentiment: Dict[str, pd.Series] = {}
+            split_index = common_index[start_idx:end_idx]
+
+            for code, stock_data in stock_dataset.items():
+                sliced_prices = stock_data.prices.reindex(split_index)
+                sliced_volumes = stock_data.volumes.reindex(split_index)
+                split_dataset[code] = StockData(
+                    code=code,
+                    prices=sliced_prices,
+                    volumes=sliced_volumes,
+                    dates=split_index
+                )
+                split_sentiment[code] = sentiment_scores_map.get(
+                    code, pd.Series(0.0, index=stock_data.dates)
+                ).reindex(split_index).fillna(0)
+
+            split_output[split_name] = {
+                'stock_dataset': split_dataset,
+                'sentiment_scores_map': split_sentiment,
+                'stock_data': self.data_agent._build_portfolio_data(split_dataset)
+            }
+
+        split_output['ranges'] = {
+            name: (
+                str(common_index[start_idx].date()),
+                str(common_index[end_idx - 1].date())
+            )
+            for name, (start_idx, end_idx) in split_points.items()
+        }
+        return split_output
+
+    def _materialize_factors_for_dataset(self, factors: List[Factor],
+                                         stock_dataset: Dict[str, StockData],
+                                         sentiment_scores_map: Dict[str, pd.Series]) -> List[Factor]:
+        """将已有因子表达式重新映射到指定数据集（保持IC不变）"""
+        materialized: List[Factor] = []
+        for factor in factors:
+            per_stock_values: List[pd.Series] = []
+            for code, stock_data in stock_dataset.items():
+                factor_values = self.factor_agent._execute_factor_expression(
+                    factor.expression,
+                    stock_data,
+                    sentiment_scores_map.get(code, pd.Series(0.0, index=stock_data.dates))
+                )
+                if factor_values is None or factor_values.isna().all():
+                    continue
+                per_stock_values.append(factor_values.rename(code))
+
+            if not per_stock_values:
+                continue
+
+            factor_matrix = pd.concat(per_stock_values, axis=1, join='inner')
+            materialized.append(Factor(
+                name=factor.name,
+                description=factor.description,
+                expression=factor.expression,
+                values=factor_matrix.mean(axis=1).dropna(),
+                ic=factor.ic,
+                source=factor.source
+            ))
+        return materialized
+
+    def _select_top_n_by_validation(self, train_stock_data: StockData, val_stock_data: StockData,
+                                    train_factors: List[Factor], val_factors: List[Factor]) -> Dict:
+        """在Validation上挑选最佳top_n参数"""
+        if not train_factors or not val_factors:
+            raise ValueError("缺少可用于策略构建的因子")
+
+        max_candidate = min(5, len(train_factors), len(val_factors))
+        candidate_top_ns = list(range(2, max_candidate + 1)) if max_candidate >= 2 else [1]
+
+        best = None
+        for top_n in candidate_top_ns:
+            print(f"\n  🧪 Validation调参: 尝试 top_n={top_n}")
+            train_strategy = self.strategy_agent.run(train_stock_data, train_factors, top_n=top_n)
+            selected_names = {f.name for f in train_strategy['selected_factors']}
+            val_selected_pool = [f for f in val_factors if f.name in selected_names]
+            val_strategy = self.strategy_agent.run(
+                val_stock_data,
+                val_selected_pool if val_selected_pool else val_factors,
+                top_n=top_n
+            )
+            val_backtest = self.backtest_engine.run(
+                val_stock_data,
+                val_strategy['composite_signal'],
+                val_strategy['selected_factors']
+            )
+            score = val_backtest.sharpe_ratio
+            if best is None or score > best['score']:
+                best = {
+                    'score': score,
+                    'top_n': top_n,
+                    'strategy': val_strategy,
+                    'backtest': val_backtest
+                }
+
+        print(
+            f"\n  ✅ Validation最佳参数: top_n={best['top_n']} | "
+            f"Sharpe={best['backtest'].sharpe_ratio:.2f}"
+        )
+        return best
 
 
 # ==================== 可视化 ====================
