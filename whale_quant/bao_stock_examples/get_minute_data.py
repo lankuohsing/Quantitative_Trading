@@ -15,7 +15,7 @@ print('login respond  error_msg:'+lg.error_msg)
 rs = bs.query_history_k_data_plus("sh.600000",
     "date,time,code,open,high,low,close,volume,amount,adjustflag",
     start_date='2022-07-01', end_date='2022-07-31',
-    frequency="5", adjustflag="3")
+    frequency="5", adjustflag="2")
 print('query_history_k_data_plus respond error_code:'+rs.error_code)
 print('query_history_k_data_plus respond  error_msg:'+rs.error_msg)
 
@@ -27,7 +27,7 @@ while (rs.error_code == '0') & rs.next():
 result = pd.DataFrame(data_list, columns=rs.fields)
 
 #### 结果集输出到csv文件 ####   
-result.to_csv("outputs/history_A_stock_k_data_by_minute.csv", index=False)
+result.to_csv("outputs/history_A_stock_k_data_5_minute.csv", index=False)
 display(result)
 
 #### 登出系统 ####
